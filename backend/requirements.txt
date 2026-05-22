@@ -1,7 +1,16 @@
 confluent-kafka==2.4.0
 quixstreams==2.6.0
-pydantic==2.7.1
+pydantic>=2.9.0
 pydantic-settings==2.3.0
 python-dotenv==1.0.1
 structlog==24.2.0
 rich==13.7.1
+langgraph>=0.2.28
+langchain-google-genai>=2.0.0
+langchain-core
+google-genai>=2.6.0
+asyncpg==0.29.0
+sqlalchemy[asyncio]==2.0.35
+pgvector==0.3.2
+stripe==10.12.0
+httpx>=0.28.1

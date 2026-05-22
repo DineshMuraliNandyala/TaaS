@@ -25,6 +25,18 @@ class Settings(BaseSettings):
     kafka_ssl_cert_path: str = "certs/service.cert"
     kafka_ssl_key_path: str = "certs/service.key"
 
+    # ── Neon Postgres ────────────────────────────────────────────────────────
+    database_url: str
+
+    # ── Gemini ───────────────────────────────────────────────────────────────
+    gemini_api_key: str
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_embedding_model: str = "models/gemini-embedding-001"
+
+    # ── Stripe ───────────────────────────────────────────────────────────────
+    stripe_secret_key: str = ""
+    stripe_meter_event_name: str = "triage_event"
+
     # ── Topics ───────────────────────────────────────────────────────────────
     topic_telemetry: str = "clinical_telemetry"
     topic_alerts: str = "critical_alerts"
