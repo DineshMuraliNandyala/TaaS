@@ -1,0 +1,7 @@
+confluent-kafka==2.4.0
+quixstreams==2.6.0
+pydantic==2.7.1
+pydantic-settings==2.3.0
+python-dotenv==1.0.1
+structlog==24.2.0
+rich==13.7.1
