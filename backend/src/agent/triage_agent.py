@@ -21,6 +21,8 @@ import time
 import asyncio
 from typing import Any
 
+import tenacity
+
 from google import genai
 from google.genai import types
 import stripe
@@ -388,20 +390,74 @@ Rules:
 - CRITICAL severity must always produce urgency_level of IMMEDIATE or URGENT.
 """
 
-    try:
-        response = gemini_client.models.generate_content(
+    # ── Retry policy ─────────────────────────────────────────────────────────
+    # Retries up to 3 times for transient Gemini errors (503, network issues).
+    # Exponential backoff: 2s → 4s → 8s (capped at 30s).
+    # JSON parse errors are NOT retried — the model produced bad output, not a
+    # transient failure; retrying the same prompt won't help.
+    @tenacity.retry(
+        wait=tenacity.wait_exponential(multiplier=1, min=2, max=30),
+        stop=tenacity.stop_after_attempt(3),
+        retry=tenacity.retry_if_not_exception_type(json.JSONDecodeError),
+        before_sleep=lambda rs: log.warning(
+            "node3_gemini_retry",
+            patient_id=alert.patient_id,
+            attempt=rs.attempt_number,
+            wait_s=rs.next_action.sleep,  # type: ignore[union-attr]
+        ),
+        reraise=True,
+    )
+    def _call_gemini() -> str:
+        """Synchronous Gemini call wrapped in retry policy."""
+        resp = gemini_client.models.generate_content(
             model=settings.gemini_model,
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.1,        # low temperature for clinical determinism
-                max_output_tokens=4096,
+                # 8192 tokens prevents JSON truncation (4096 was too small for
+                # verbose 5-action + SOP responses, causing 'Unterminated string')
+                max_output_tokens=8192,
                 response_mime_type="application/json",
             ),
         )
-        raw_json = response.text.strip()
+        return resp.text.strip()
 
-        # Parse and validate the response
-        parsed = json.loads(raw_json)
+    def _repair_json(raw: str) -> str:
+        """
+        Last-resort repair for truncated JSON: trim to the last complete `}`
+        so json.loads() can recover a partial-but-parseable object.
+        Only triggered if the initial parse fails.
+        """
+        last_brace = raw.rfind("}")
+        if last_brace == -1:
+            raise ValueError("No closing brace found — JSON unrecoverable")
+        candidate = raw[: last_brace + 1]
+        # Ensure top-level object is closed
+        if candidate.count("{") > candidate.count("}"):
+            candidate += "}"
+        return candidate
+
+    try:
+        raw_json = _call_gemini()
+
+        # ── Parse JSON — with truncation repair fallback ──────────────────────
+        try:
+            parsed = json.loads(raw_json)
+        except json.JSONDecodeError as first_exc:
+            log.warning(
+                "node3_json_truncated_attempting_repair",
+                patient_id=alert.patient_id,
+                error=str(first_exc),
+                raw_len=len(raw_json),
+            )
+            repaired = _repair_json(raw_json)
+            parsed = json.loads(repaired)   # raises JSONDecodeError if still bad
+            log.info(
+                "node3_json_repaired",
+                patient_id=alert.patient_id,
+                original_len=len(raw_json),
+                repaired_len=len(repaired),
+            )
 
         state.recommendation = TriageRecommendation(
             alert_id=alert.alert_id,
@@ -436,7 +492,7 @@ Rules:
             "node3_json_parse_error",
             patient_id=alert.patient_id,
             error=str(exc),
-            raw_response=raw_json[:500] if 'raw_json' in dir() else "no response",
+            raw_response=raw_json[:500] if 'raw_json' in locals() else "no response",
         )
         state.llm_error = f"JSON parse error: {exc}"
 

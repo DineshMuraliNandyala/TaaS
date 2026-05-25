@@ -14,3 +14,6 @@ sqlalchemy[asyncio]==2.0.35
 pgvector==0.3.2
 stripe==10.12.0
 httpx>=0.28.1
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+websockets==13.1
