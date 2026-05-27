@@ -289,6 +289,67 @@ def process_message(raw_value: dict) -> Optional[dict]:
     return alert.model_dump(mode="json")
 
 
+# ── Explicit Alert Producer ───────────────────────────────────────────────────
+#
+# Quix Streams' built-in to_topic() silently drops messages when the apply()
+# function returns None for most rows.  To guarantee alert delivery, we use
+# a dedicated confluent-kafka Producer inside an SDF .update() callback.
+
+from confluent_kafka import Producer as _KafkaProducer
+import json as _json
+
+_alert_producer: Optional[_KafkaProducer] = None
+
+
+def _get_alert_producer() -> _KafkaProducer:
+    """Lazy-initialise a module-level Kafka producer for alert output."""
+    global _alert_producer
+    if _alert_producer is None:
+        _alert_producer = _KafkaProducer({
+            "bootstrap.servers":        settings.kafka_brokers,
+            "security.protocol":        "SSL",
+            "ssl.ca.location":          settings.kafka_ca_cert_path,
+            "ssl.certificate.location": settings.kafka_ssl_cert_path,
+            "ssl.key.location":         settings.kafka_ssl_key_path,
+            "acks":                     "all",
+            "enable.idempotence":       True,
+            "retries":                  5,
+            "retry.backoff.ms":         500,
+            "linger.ms":               10,
+            "compression.type":        "lz4",
+        })
+    return _alert_producer
+
+
+def _produce_alert(alert_dict: dict) -> None:
+    """
+    Produce a single alert dict to the critical_alerts topic.
+    Called inside sdf.update() for every message that passes the filter.
+    """
+    producer = _get_alert_producer()
+    value = _json.dumps(alert_dict).encode("utf-8")
+    key = alert_dict.get("patient_id", "unknown").encode("utf-8")
+
+    producer.produce(
+        topic=settings.topic_alerts,
+        key=key,
+        value=value,
+        on_delivery=lambda err, msg: (
+            log.error("alert_produce_failed", error=str(err))
+            if err else
+            log.info(
+                "alert_produced_to_kafka",
+                topic=msg.topic(),
+                partition=msg.partition(),
+                offset=msg.offset(),
+                patient_id=alert_dict.get("patient_id"),
+            )
+        ),
+    )
+    # Non-blocking poll to trigger delivery callbacks
+    producer.poll(0)
+
+
 # ── Quix Application ─────────────────────────────────────────────────────────
 
 def build_application() -> Application:
@@ -320,17 +381,16 @@ def run_cep_engine() -> None:
     Wire up the Quix Streams pipeline and start the blocking consume loop.
 
     Pipeline:
-      input_topic → apply(process_message) → filter(not None) → output_topic
+      input_topic → apply(process_message) → filter(not None) → update(_produce_alert)
+
+    We use an explicit confluent-kafka Producer via update() instead of
+    Quix's built-in to_topic(), which silently drops alerts.
     """
     app = build_application()
 
     input_topic = app.topic(
         name=settings.topic_telemetry,
         value_deserializer="json",
-    )
-    output_topic = app.topic(
-        name=settings.topic_alerts,
-        value_serializer="json",
     )
 
     log.info(
@@ -345,10 +405,16 @@ def run_cep_engine() -> None:
     sdf = app.dataframe(input_topic)
     sdf = sdf.apply(process_message, expand=False)
     sdf = sdf.filter(lambda x: x is not None)
-    sdf.to_topic(output_topic)
+    # Use update() with an explicit producer instead of to_topic()
+    sdf = sdf.update(_produce_alert)
 
     def _handle_signal(sig, _frame):
         log.info("cep_engine_shutdown_signal", signal=sig)
+        # Flush any remaining alerts
+        producer = _get_alert_producer()
+        remaining = producer.flush(timeout=10)
+        if remaining > 0:
+            log.warning("alert_producer_flush_incomplete", remaining=remaining)
         app.stop()
         sys.exit(0)
 
