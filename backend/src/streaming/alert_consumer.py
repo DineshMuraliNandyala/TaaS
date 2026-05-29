@@ -17,6 +17,7 @@ Design notes:
 """
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -56,6 +57,14 @@ def _build_consumer() -> Consumer:
     return Consumer(config)
 
 
+# ── Alert Throttling ──────────────────────────────────────────────────────────
+# The CEP engine fires alerts every ~2s during a deterioration cycle.
+# Without throttling, this burns through the Gemini free-tier quota
+# (20 req/day) in seconds. We allow at most 1 triage per patient
+# per ALERT_COOLDOWN_SECONDS.
+ALERT_COOLDOWN_SECONDS = 60
+
+
 class AlertConsumer:
     """
     Manages the Kafka consumer lifecycle inside FastAPI.
@@ -67,6 +76,9 @@ class AlertConsumer:
         self._running = False
         self._processed = 0
         self._errors = 0
+        self._skipped = 0
+        # Tracks last triage timestamp per patient_id for throttling
+        self._last_triage: dict[str, float] = {}
 
     async def start(self) -> None:
         """
@@ -164,6 +176,21 @@ class AlertConsumer:
             )
             return
 
+        # ── Per-patient throttle ──────────────────────────────────────────
+        # Skip if we've already triaged this patient within the cooldown
+        now = time.monotonic()
+        last = self._last_triage.get(alert.patient_id, 0)
+        if now - last < ALERT_COOLDOWN_SECONDS:
+            self._skipped += 1
+            log.debug(
+                "alert_throttled",
+                patient_id=alert.patient_id,
+                seconds_since_last=round(now - last, 1),
+                cooldown=ALERT_COOLDOWN_SECONDS,
+                total_skipped=self._skipped,
+            )
+            return
+
         log.info(
             "alert_received_by_fastapi",
             alert_id=alert.alert_id,
@@ -182,6 +209,9 @@ class AlertConsumer:
         )
 
         # ── Step 2: Run triage agent ──────────────────────────────────────
+        # Record triage timestamp BEFORE the agent call to prevent
+        # concurrent alerts from also triggering during the ~30s agent run
+        self._last_triage[alert.patient_id] = time.monotonic()
         recommendation = await run_triage_agent(alert)
         self._processed += 1
 

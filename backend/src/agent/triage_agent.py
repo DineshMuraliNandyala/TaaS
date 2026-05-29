@@ -40,6 +40,9 @@ from backend.src.models.agent import (
     UrgencyLevel,
 )
 from backend.src.models.telemetry import CriticalAlert
+from backend.src.observability.telemetry import get_tracer
+
+tracer = get_tracer(__name__)
 
 log = get_logger(__name__)
 
@@ -59,18 +62,23 @@ async def fetch_patient_context(state: TriageAgentState) -> TriageAgentState:
     partial context rather than failing the entire pipeline.
     """
     alert = CriticalAlert.model_validate(state.alert_dict)
-    log.info(
-        "node1_fetch_patient_context_start",
-        patient_id=alert.patient_id,
-        alert_id=alert.alert_id,
-    )
+    with tracer.start_as_current_span("node1.fetch_patient_context") as span:
+        span.set_attribute("patient.id", alert.patient_id)
+        span.set_attribute("alert.id", alert.alert_id)
+        span.set_attribute("alert.severity", alert.severity.value)
 
-    try:
-        async with get_session() as session:
-            # Fetch patient record
-            result = await session.execute(
-                text("""
-                    SELECT
+        log.info(
+            "node1_fetch_patient_context_start",
+            patient_id=alert.patient_id,
+            alert_id=alert.alert_id,
+        )
+
+        try:
+            async with get_session() as session:
+                # Fetch patient record
+                result = await session.execute(
+                    text("""
+                        SELECT
                         patient_id, full_name, date_of_birth, gender,
                         blood_type, weight_kg, allergies,
                         chronic_conditions, active_medications
@@ -131,16 +139,22 @@ async def fetch_patient_context(state: TriageAgentState) -> TriageAgentState:
                 recent_alerts=recent_count,
             )
 
-    except Exception as exc:
-        log.error(
-            "node1_fetch_error",
-            patient_id=alert.patient_id,
-            error=str(exc),
-            exc_info=True,
-        )
-        state.context_fetch_error = str(exc)
+        except Exception as exc:
+            log.error(
+                "node1_fetch_error",
+                patient_id=alert.patient_id,
+                error=str(exc),
+                exc_info=True,
+            )
+            state.context_fetch_error = str(exc)
 
-    return state
+        if state.patient_context:
+            span.set_attribute("patient.age", state.patient_context.age_years)
+            span.set_attribute(
+                "patient.conditions",
+                str(state.patient_context.chronic_conditions)
+            )
+        return state
 
 
 # ── Node 2: Hybrid RAG Lookup ─────────────────────────────────────────────────
@@ -158,135 +172,145 @@ async def hybrid_rag_lookup(state: TriageAgentState) -> TriageAgentState:
     """
     alert = CriticalAlert.model_validate(state.alert_dict)
 
-    # Build a rich query from the alert's triggered rules + vitals
-    vitals = alert.vitals_snapshot
-    rules_text = ". ".join(alert.triggered_rules)
-    rag_query = (
-        f"Clinical protocol for: {rules_text}. "
-        f"Patient presenting with HR {vitals.heart_rate_bpm} bpm, "
-        f"BP {vitals.systolic_bp_mmhg}/{vitals.diastolic_bp_mmhg} mmHg, "
-        f"SpO2 {vitals.spo2_percent}%, "
-        f"RR {vitals.respiratory_rate_rpm} rpm, "
-        f"Temp {vitals.temperature_celsius}°C. "
-        f"Severity: {alert.severity.value}."
-    )
-    state.rag_query_used = rag_query
+    with tracer.start_as_current_span("node2.hybrid_rag_lookup") as span:
+        span.set_attribute("patient.id", alert.patient_id)
+        span.set_attribute("rag.query_length", len(state.rag_query_used or ""))
 
-    log.info(
-        "node2_hybrid_rag_start",
-        patient_id=alert.patient_id,
-        query_preview=rag_query[:120],
-    )
-
-    try:
-        # Generate query embedding
-        embed_result = gemini_client.models.embed_content(
-            model=settings.gemini_embedding_model,
-            contents=rag_query,
-            config=types.EmbedContentConfig(
-                task_type="RETRIEVAL_QUERY",
-                output_dimensionality=768,
-            ),
+        # Build a rich query from the alert's triggered rules + vitals
+        vitals = alert.vitals_snapshot
+        rules_text = ". ".join(alert.triggered_rules)
+        rag_query = (
+            f"Clinical protocol for: {rules_text}. "
+            f"Patient presenting with HR {vitals.heart_rate_bpm} bpm, "
+            f"BP {vitals.systolic_bp_mmhg}/{vitals.diastolic_bp_mmhg} mmHg, "
+            f"SpO2 {vitals.spo2_percent}%, "
+            f"RR {vitals.respiratory_rate_rpm} rpm, "
+            f"Temp {vitals.temperature_celsius}°C. "
+            f"Severity: {alert.severity.value}."
         )
-        query_embedding = embed_result.embeddings[0].values
-
-        async with get_session() as session:
-            # ── Vector search (top 5 by cosine similarity) ───────────────────
-            vector_results = await session.execute(
-                text("""
-                    SELECT
-                        id, title, category, content,
-                        1 - (embedding <=> CAST(:embedding AS vector)) AS score
-                    FROM clinical_sops
-                    ORDER BY embedding <=> CAST(:embedding AS vector)
-                    LIMIT 5
-                """),
-                {"embedding": str(query_embedding)},
-            )
-            vector_rows = vector_results.mappings().fetchall()
-
-            # ── Keyword search (full-text, top 5) ────────────────────────────
-            # Extract key clinical terms from triggered rules for tsquery
-            keyword_terms = " | ".join([
-                word for rule in alert.triggered_rules
-                for word in rule.split()
-                if len(word) > 4  # filter short words
-            ])
-
-            keyword_results = await session.execute(
-                text("""
-                    SELECT
-                        id, title, category, content,
-                        ts_rank(
-                            to_tsvector('english', title || ' ' || content),
-                            plainto_tsquery('english', :query)
-                        ) AS score
-                    FROM clinical_sops
-                    WHERE to_tsvector('english', title || ' ' || content)
-                          @@ plainto_tsquery('english', :query)
-                    ORDER BY score DESC
-                    LIMIT 5
-                """),
-                {"query": rag_query},
-            )
-            keyword_rows = keyword_results.mappings().fetchall()
-
-        # ── Reciprocal Rank Fusion (RRF) ─────────────────────────────────────
-        # RRF score = 1/(k + rank) where k=60 is a standard smoothing constant
-        # Merges rankings from both retrieval signals without needing score normalisation
-        k = 60
-        rrf_scores: dict[int, float] = {}
-        doc_data: dict[int, dict] = {}
-
-        for rank, row in enumerate(vector_rows):
-            doc_id = row["id"]
-            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + 1 / (k + rank + 1)
-            doc_data[doc_id] = {
-                **dict(row), "retrieval_method": "vector"
-            }
-
-        for rank, row in enumerate(keyword_rows):
-            doc_id = row["id"]
-            rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + 1 / (k + rank + 1)
-            if doc_id in doc_data:
-                doc_data[doc_id]["retrieval_method"] = "hybrid"
-            else:
-                doc_data[doc_id] = {
-                    **dict(row), "retrieval_method": "keyword"
-                }
-
-        # Sort by RRF score, take top 3
-        top_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)[:3]
-
-        state.retrieved_sops = [
-            SOPDocument(
-                title=doc_data[doc_id]["title"],
-                category=doc_data[doc_id]["category"],
-                content=doc_data[doc_id]["content"],
-                relevance_score=round(rrf_scores[doc_id], 6),
-                retrieval_method=doc_data[doc_id]["retrieval_method"],
-            )
-            for doc_id in top_ids
-        ]
+        state.rag_query_used = rag_query
 
         log.info(
-            "node2_rag_complete",
+            "node2_hybrid_rag_start",
             patient_id=alert.patient_id,
-            sops_retrieved=len(state.retrieved_sops),
-            titles=[s.title for s in state.retrieved_sops],
-            methods=[s.retrieval_method for s in state.retrieved_sops],
+            query_preview=rag_query[:120],
         )
 
-    except Exception as exc:
-        log.error(
-            "node2_rag_error",
-            patient_id=alert.patient_id,
-            error=str(exc),
-            exc_info=True,
-        )
+        try:
+            # Generate query embedding
+            embed_result = gemini_client.models.embed_content(
+                model=settings.gemini_embedding_model,
+                contents=rag_query,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_QUERY",
+                    output_dimensionality=768,
+                ),
+            )
+            query_embedding = embed_result.embeddings[0].values
+
+            async with get_session() as session:
+                # ── Vector search (top 5 by cosine similarity) ───────────────────
+                vector_results = await session.execute(
+                    text("""
+                        SELECT
+                            id, title, category, content,
+                            1 - (embedding <=> CAST(:embedding AS vector)) AS score
+                        FROM clinical_sops
+                        ORDER BY embedding <=> CAST(:embedding AS vector)
+                        LIMIT 5
+                    """),
+                    {"embedding": str(query_embedding)},
+                )
+                vector_rows = vector_results.mappings().fetchall()
+
+                # ── Keyword search (full-text, top 5) ────────────────────────────
+                # Extract key clinical terms from triggered rules for tsquery
+                keyword_terms = " | ".join([
+                    word for rule in alert.triggered_rules
+                    for word in rule.split()
+                    if len(word) > 4  # filter short words
+                ])
+
+                keyword_results = await session.execute(
+                    text("""
+                        SELECT
+                            id, title, category, content,
+                            ts_rank(
+                                to_tsvector('english', title || ' ' || content),
+                                plainto_tsquery('english', :query)
+                            ) AS score
+                        FROM clinical_sops
+                        WHERE to_tsvector('english', title || ' ' || content)
+                              @@ plainto_tsquery('english', :query)
+                        ORDER BY score DESC
+                        LIMIT 5
+                    """),
+                    {"query": rag_query},
+                )
+                keyword_rows = keyword_results.mappings().fetchall()
+
+                # ── Reciprocal Rank Fusion (RRF) ─────────────────────────────────────
+                # RRF score = 1/(k + rank) where k=60 is a standard smoothing constant
+                # Merges rankings from both retrieval signals without needing score normalisation
+                k = 60
+                rrf_scores: dict[int, float] = {}
+                doc_data: dict[int, dict] = {}
+
+                for rank, row in enumerate(vector_rows):
+                    doc_id = row["id"]
+                    rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + 1 / (k + rank + 1)
+                    doc_data[doc_id] = {
+                        **dict(row), "retrieval_method": "vector"
+                    }
+
+                for rank, row in enumerate(keyword_rows):
+                    doc_id = row["id"]
+                    rrf_scores[doc_id] = rrf_scores.get(doc_id, 0) + 1 / (k + rank + 1)
+                    if doc_id in doc_data:
+                        doc_data[doc_id]["retrieval_method"] = "hybrid"
+                    else:
+                        doc_data[doc_id] = {
+                            **dict(row), "retrieval_method": "keyword"
+                        }
+
+                # Sort by RRF score, take top 3
+                top_ids = sorted(rrf_scores, key=lambda x: rrf_scores[x], reverse=True)[:3]
+
+                state.retrieved_sops = [
+                    SOPDocument(
+                        title=doc_data[doc_id]["title"],
+                        category=doc_data[doc_id]["category"],
+                        content=doc_data[doc_id]["content"],
+                        relevance_score=round(rrf_scores[doc_id], 6),
+                        retrieval_method=doc_data[doc_id]["retrieval_method"],
+                    )
+                    for doc_id in top_ids
+                ]
+
+                log.info(
+                    "node2_rag_complete",
+                    patient_id=alert.patient_id,
+                    sops_retrieved=len(state.retrieved_sops),
+                    titles=[s.title for s in state.retrieved_sops],
+                    methods=[s.retrieval_method for s in state.retrieved_sops],
+                )
+
+        except Exception as exc:
+            log.error(
+                "node2_rag_error",
+                patient_id=alert.patient_id,
+                error=str(exc),
+                exc_info=True,
+            )
+
         # Continue with empty SOPs — agent degrades gracefully
 
-    return state
+        span.set_attribute("rag.sops_retrieved", len(state.retrieved_sops))
+        span.set_attribute(
+            "rag.retrieval_methods",
+            str([s.retrieval_method for s in state.retrieved_sops])
+        )
+        return state
 
 
 # ── Node 3: Gemini Reasoning ──────────────────────────────────────────────────
@@ -300,212 +324,249 @@ async def gemini_reasoning(state: TriageAgentState) -> TriageAgentState:
     that maps directly to the TriageRecommendation Pydantic schema.
     """
     alert = CriticalAlert.model_validate(state.alert_dict)
-    log.info(
-        "node3_gemini_reasoning_start",
-        patient_id=alert.patient_id,
-        alert_id=alert.alert_id,
-        sops_available=len(state.retrieved_sops),
-        has_patient_context=state.patient_context is not None,
-    )
-
-    # ── Build context blocks ──────────────────────────────────────────────────
-
-    # Patient context block
-    if state.patient_context:
-        ctx = state.patient_context
-        meds = ", ".join(
-            f"{m.get('name','?')} {m.get('dose','')}" 
-            for m in ctx.active_medications
-        )
-        patient_block = f"""
-PATIENT CONTEXT:
-- Name: {ctx.full_name}, Age: {ctx.age_years}y, Gender: {ctx.gender}
-- Blood Type: {ctx.blood_type or 'Unknown'}, Weight: {ctx.weight_kg or 'Unknown'} kg
-- Known Allergies: {', '.join(ctx.allergies) or 'None documented'}
-- Chronic Conditions: {', '.join(ctx.chronic_conditions) or 'None documented'}
-- Active Medications: {meds or 'None documented'}
-- Triage alerts in last 24h: {ctx.recent_triage_count}
-"""
-    else:
-        patient_block = "PATIENT CONTEXT: Not available (database lookup failed).\n"
-
-    # SOP context block
-    sop_block = "\nRELEVANT CLINICAL SOPs:\n"
-    for i, sop in enumerate(state.retrieved_sops, 1):
-        sop_block += f"\n[SOP {i}: {sop.title} — {sop.category}]\n{sop.content}\n"
-
-    if not state.retrieved_sops:
-        sop_block += "No SOPs retrieved — apply general clinical judgment.\n"
-
-    # Alert block
-    v = alert.vitals_snapshot
-    alert_block = f"""
-CRITICAL ALERT:
-- Patient ID: {alert.patient_id} | Ward: {alert.ward} | Bed: {alert.bed_number}
-- Alert Severity: {alert.severity.value}
-- Triggered Rules: {'; '.join(alert.triggered_rules)}
-- Vitals Snapshot:
-    Heart Rate:        {v.heart_rate_bpm} bpm
-    Blood Pressure:    {v.systolic_bp_mmhg}/{v.diastolic_bp_mmhg} mmHg
-    SpO2:              {v.spo2_percent}%
-    Respiratory Rate:  {v.respiratory_rate_rpm} rpm
-    Temperature:       {v.temperature_celsius}°C
-- Nursing Notes: {alert.nursing_notes or 'None recorded'}
-"""
-
-    # ── Structured output prompt ──────────────────────────────────────────────
-    prompt = f"""You are a senior clinical decision support AI embedded in a hospital 
-triage system. Your role is to synthesise real-time patient vitals, patient history, 
-and clinical protocols into an actionable triage recommendation for the clinical team.
-
-{alert_block}
-{patient_block}
-{sop_block}
-
-Based on the above, produce a clinical triage recommendation. You MUST respond with 
-ONLY valid JSON matching this exact schema — no preamble, no markdown, no explanation:
-
-{{
-  "urgency_level": "IMMEDIATE | URGENT | SEMI_URGENT | NON_URGENT",
-  "clinical_summary": "<2-3 sentence synthesis of current patient status and primary concern>",
-  "primary_concern": "<single most critical issue>",
-  "recommended_actions": [
-    {{
-      "priority": <1-5, 1=highest>,
-      "action": "<specific clinical action>",
-      "rationale": "<why this action, referencing patient history or SOP>",
-      "time_window": "<when, e.g. 'within 15 minutes'>"
-    }}
-  ],
-  "contraindications": ["<medication or intervention to avoid and why>"],
-  "sops_referenced": ["<SOP title>"],
-  "confidence_score": <0.0 to 1.0>
-}}
-
-Rules:
-- Provide 3-5 recommended_actions ordered by priority (1 = most urgent).
-- Reference specific patient allergies, conditions, and medications in rationale.
-- List any contraindications based on known allergies or drug interactions.
-- Confidence score reflects data completeness (1.0 = full context available).
-- CRITICAL severity must always produce urgency_level of IMMEDIATE or URGENT.
-"""
-
-    # ── Retry policy ─────────────────────────────────────────────────────────
-    # Retries up to 3 times for transient Gemini errors (503, network issues).
-    # Exponential backoff: 2s → 4s → 8s (capped at 30s).
-    # JSON parse errors are NOT retried — the model produced bad output, not a
-    # transient failure; retrying the same prompt won't help.
-    @tenacity.retry(
-        wait=tenacity.wait_exponential(multiplier=1, min=2, max=30),
-        stop=tenacity.stop_after_attempt(3),
-        retry=tenacity.retry_if_not_exception_type(json.JSONDecodeError),
-        before_sleep=lambda rs: log.warning(
-            "node3_gemini_retry",
-            patient_id=alert.patient_id,
-            attempt=rs.attempt_number,
-            wait_s=rs.next_action.sleep,  # type: ignore[union-attr]
-        ),
-        reraise=True,
-    )
-    def _call_gemini() -> str:
-        """Synchronous Gemini call wrapped in retry policy."""
-        resp = gemini_client.models.generate_content(
-            model=settings.gemini_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,        # low temperature for clinical determinism
-                # 8192 tokens prevents JSON truncation (4096 was too small for
-                # verbose 5-action + SOP responses, causing 'Unterminated string')
-                max_output_tokens=8192,
-                response_mime_type="application/json",
-            ),
-        )
-        return resp.text.strip()
-
-    def _repair_json(raw: str) -> str:
-        """
-        Last-resort repair for truncated JSON: trim to the last complete `}`
-        so json.loads() can recover a partial-but-parseable object.
-        Only triggered if the initial parse fails.
-        """
-        last_brace = raw.rfind("}")
-        if last_brace == -1:
-            raise ValueError("No closing brace found — JSON unrecoverable")
-        candidate = raw[: last_brace + 1]
-        # Ensure top-level object is closed
-        if candidate.count("{") > candidate.count("}"):
-            candidate += "}"
-        return candidate
-
-    try:
-        raw_json = _call_gemini()
-
-        # ── Parse JSON — with truncation repair fallback ──────────────────────
-        try:
-            parsed = json.loads(raw_json)
-        except json.JSONDecodeError as first_exc:
-            log.warning(
-                "node3_json_truncated_attempting_repair",
-                patient_id=alert.patient_id,
-                error=str(first_exc),
-                raw_len=len(raw_json),
-            )
-            repaired = _repair_json(raw_json)
-            parsed = json.loads(repaired)   # raises JSONDecodeError if still bad
-            log.info(
-                "node3_json_repaired",
-                patient_id=alert.patient_id,
-                original_len=len(raw_json),
-                repaired_len=len(repaired),
-            )
-
-        state.recommendation = TriageRecommendation(
-            alert_id=alert.alert_id,
-            patient_id=alert.patient_id,
-            hospital_id=alert.hospital_id,
-            urgency_level=UrgencyLevel(parsed["urgency_level"]),
-            clinical_summary=parsed["clinical_summary"],
-            primary_concern=parsed["primary_concern"],
-            recommended_actions=[
-                RecommendedAction(**a) for a in parsed["recommended_actions"]
-            ],
-            contraindications=parsed.get("contraindications", []),
-            sops_referenced=parsed.get("sops_referenced", []),
-            confidence_score=float(parsed["confidence_score"]),
-            llm_model_used=settings.gemini_model,
-            processing_ms=int(
-                (time.time() * 1000) - state.start_time_ms
-            ),
-        )
+    with tracer.start_as_current_span("node3.gemini_reasoning") as span:
+        span.set_attribute("patient.id", alert.patient_id)
+        span.set_attribute("llm.model", settings.gemini_model)
+        span.set_attribute("llm.sops_in_context", len(state.retrieved_sops))
 
         log.info(
-            "node3_recommendation_generated",
+            "node3_gemini_reasoning_start",
             patient_id=alert.patient_id,
-            urgency=state.recommendation.urgency_level.value,
-            confidence=state.recommendation.confidence_score,
-            actions_count=len(state.recommendation.recommended_actions),
-            processing_ms=state.recommendation.processing_ms,
+            alert_id=alert.alert_id,
+            sops_available=len(state.retrieved_sops),
+            has_patient_context=state.patient_context is not None,
         )
+        try:
+            # ── Build context blocks ──────────────────────────────────────────────────
 
-    except json.JSONDecodeError as exc:
-        log.error(
-            "node3_json_parse_error",
-            patient_id=alert.patient_id,
-            error=str(exc),
-            raw_response=raw_json[:500] if 'raw_json' in locals() else "no response",
-        )
-        state.llm_error = f"JSON parse error: {exc}"
+            # Patient context block
+            if state.patient_context:
+                ctx = state.patient_context
+                meds = ", ".join(
+            f"{m.get('name','?')} {m.get('dose','')}" 
+            for m in ctx.active_medications
+            )
+                patient_block = f"""
+                PATIENT CONTEXT:
+                - Name: {ctx.full_name}, Age: {ctx.age_years}y, Gender: {ctx.gender}
+                - Blood Type: {ctx.blood_type or 'Unknown'}, Weight: {ctx.weight_kg or 'Unknown'} kg
+                - Known Allergies: {', '.join(ctx.allergies) or 'None documented'}
+                - Chronic Conditions: {', '.join(ctx.chronic_conditions) or 'None documented'}
+                - Active Medications: {meds or 'None documented'}
+                - Triage alerts in last 24h: {ctx.recent_triage_count}
+            """
+            else:
+                patient_block = "PATIENT CONTEXT: Not available (database lookup failed).\n"
 
-    except Exception as exc:
-        log.error(
-            "node3_gemini_error",
-            patient_id=alert.patient_id,
-            error=str(exc),
-            exc_info=True,
-        )
-        state.llm_error = str(exc)
+            # SOP context block
+            sop_block = "\nRELEVANT CLINICAL SOPs:\n"
+            for i, sop in enumerate(state.retrieved_sops, 1):
+                sop_block += f"\n[SOP {i}: {sop.title} — {sop.category}]\n{sop.content}\n"
 
-    return state
+            if not state.retrieved_sops:
+                sop_block += "No SOPs retrieved — apply general clinical judgment.\n"
+
+            # Alert block
+            v = alert.vitals_snapshot
+            alert_block = f"""
+                CRITICAL ALERT:
+                - Patient ID: {alert.patient_id} | Ward: {alert.ward} | Bed: {alert.bed_number}
+                - Alert Severity: {alert.severity.value}
+                - Triggered Rules: {'; '.join(alert.triggered_rules)}
+                - Vitals Snapshot:
+                    Heart Rate:        {v.heart_rate_bpm} bpm
+                    Blood Pressure:    {v.systolic_bp_mmhg}/{v.diastolic_bp_mmhg} mmHg
+                    SpO2:              {v.spo2_percent}%
+                    Respiratory Rate:  {v.respiratory_rate_rpm} rpm
+                    Temperature:       {v.temperature_celsius}°C
+                    Nursing Notes: {alert.nursing_notes or 'None recorded'}
+                """
+
+            # ── Structured output prompt ──────────────────────────────────────────────
+            prompt = f"""You are a senior clinical decision support AI embedded in a hospital 
+                triage system. Your role is to synthesise real-time patient vitals, patient history, 
+                and clinical protocols into an actionable triage recommendation for the clinical team.
+
+                {alert_block}
+                {patient_block}
+                {sop_block}
+
+                Based on the above, produce a clinical triage recommendation. You MUST respond with 
+                ONLY valid JSON matching this exact schema — no preamble, no markdown, no explanation:
+
+                {{
+                    "urgency_level": "IMMEDIATE | URGENT | SEMI_URGENT | NON_URGENT",
+                    "clinical_summary": "<2-3 sentence synthesis of current patient status and primary concern>",
+                    "primary_concern": "<single most critical issue>",
+                    "recommended_actions": [
+                        {{
+                            "priority": <1-5, 1=highest>,
+                            "action": "<specific clinical action>",
+                            "rationale": "<why this action, referencing patient history or SOP>",
+                            "time_window": "<when, e.g. 'within 15 minutes'>"
+                        }}
+                    ],
+                    "contraindications": ["<medication or intervention to avoid and why>"],
+                    "sops_referenced": ["<SOP title>"],
+                    "confidence_score": <0.0 to 1.0>
+                }}
+
+                Rules:
+                - Provide 3-5 recommended_actions ordered by priority (1 = most urgent).
+                - Reference specific patient allergies, conditions, and medications in rationale.
+                - List any contraindications based on known allergies or drug interactions.
+                - Confidence score reflects data completeness (1.0 = full context available).
+                - CRITICAL severity must always produce urgency_level of IMMEDIATE or URGENT.
+            """
+
+            # ── Retry policy ─────────────────────────────────────────────────────────
+            # Retries up to 5 times for transient Gemini errors (429, 503, network).
+            # Exponential backoff: 5s → 10s → 20s → 40s → 60s (capped).
+            # JSON parse errors are NOT retried — the model produced bad output.
+            # 429 (RESOURCE_EXHAUSTED) gets extra wait time before retry.
+            def _is_retryable(exc: BaseException) -> bool:
+                """Return True for transient errors that should be retried."""
+                if isinstance(exc, json.JSONDecodeError):
+                    return False  # Bad model output — retrying won't help
+                # Check for google.genai.errors.ClientError with 429
+                exc_str = str(exc)
+                if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str:
+                    return True
+                if "503" in exc_str or "UNAVAILABLE" in exc_str:
+                    return True
+                # Generic network/server errors
+                if any(k in exc_str for k in ("ConnectionError", "Timeout", "500")):
+                    return True
+                return True  # Default to retry for unknown errors
+
+            @tenacity.retry(
+                wait=tenacity.wait_exponential(multiplier=2, min=5, max=60),
+                stop=tenacity.stop_after_attempt(5),
+                retry=tenacity.retry_if_exception(_is_retryable),
+                before_sleep=lambda rs: log.warning(
+                    "node3_gemini_retry",
+                    patient_id=alert.patient_id,
+                    attempt=rs.attempt_number,
+                    wait_s=rs.next_action.sleep,  # type: ignore[union-attr]
+                    error=str(rs.outcome.exception())[:120] if rs.outcome else "unknown",
+                ),
+                reraise=True,
+            )
+            def _call_gemini() -> str:
+                """Synchronous Gemini call wrapped in retry policy."""
+                resp = gemini_client.models.generate_content(
+                    model=settings.gemini_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.1,        # low temperature for clinical determinism
+                        # 8192 tokens prevents JSON truncation (4096 was too small for
+                        # verbose 5-action + SOP responses, causing 'Unterminated string')
+                        max_output_tokens=8192,
+                        response_mime_type="application/json",
+                    ),
+                )
+                return resp.text.strip()
+
+            def _repair_json(raw: str) -> str:
+                """
+                Last-resort repair for truncated JSON: trim to the last complete `}`
+                so json.loads() can recover a partial-but-parseable object.
+                Only triggered if the initial parse fails.
+                """
+                last_brace = raw.rfind("}")
+                if last_brace == -1:
+                    raise ValueError("No closing brace found — JSON unrecoverable")
+                candidate = raw[: last_brace + 1]
+                # Ensure top-level object is closed
+                if candidate.count("{") > candidate.count("}"):
+                    candidate += "}"
+                return candidate
+
+            try:
+                raw_json = _call_gemini()
+
+                # ── Parse JSON — with truncation repair fallback ──────────────────────
+                try:
+                    parsed = json.loads(raw_json)
+                except json.JSONDecodeError as first_exc:
+                    log.warning(
+                        "node3_json_truncated_attempting_repair",
+                        patient_id=alert.patient_id,
+                        error=str(first_exc),
+                        raw_len=len(raw_json),
+                    )
+                    repaired = _repair_json(raw_json)
+                    parsed = json.loads(repaired)   # raises JSONDecodeError if still bad
+                    log.info(
+                        "node3_json_repaired",
+                        patient_id=alert.patient_id,
+                        original_len=len(raw_json),
+                        repaired_len=len(repaired),
+                    )
+
+                state.recommendation = TriageRecommendation(
+                    alert_id=alert.alert_id,
+                    patient_id=alert.patient_id,
+                    hospital_id=alert.hospital_id,
+                    urgency_level=UrgencyLevel(parsed["urgency_level"]),
+                    clinical_summary=parsed["clinical_summary"],
+                    primary_concern=parsed["primary_concern"],
+                    recommended_actions=[
+                        RecommendedAction(**a) for a in parsed["recommended_actions"]
+                    ],
+                    contraindications=parsed.get("contraindications", []),
+                    sops_referenced=parsed.get("sops_referenced", []),
+                    confidence_score=float(parsed["confidence_score"]),
+                    llm_model_used=settings.gemini_model,
+                    processing_ms=int(
+                        (time.time() * 1000) - state.start_time_ms
+                    ),
+                )
+
+                log.info(
+                    "node3_recommendation_generated",
+                    patient_id=alert.patient_id,
+                    urgency=state.recommendation.urgency_level.value,
+                    confidence=state.recommendation.confidence_score,
+                    actions_count=len(state.recommendation.recommended_actions),
+                    processing_ms=state.recommendation.processing_ms,
+                )
+
+            except json.JSONDecodeError as exc:
+                log.error(
+                    "node3_json_parse_error",
+                    patient_id=alert.patient_id,
+                    error=str(exc),
+                    raw_response=raw_json[:500] if 'raw_json' in locals() else "no response",
+                )
+                state.llm_error = f"JSON parse error: {exc}"
+
+        except Exception as exc:
+            log.error(
+                "node3_gemini_error",
+                patient_id=alert.patient_id,
+                error=str(exc),
+                exc_info=True,
+            )
+            state.llm_error = str(exc)
+
+        if state.recommendation:
+            span.set_attribute(
+                "llm.urgency", state.recommendation.urgency_level.value
+            )
+            span.set_attribute(
+                "llm.confidence", state.recommendation.confidence_score
+            )
+            span.set_attribute(
+                "llm.processing_ms", state.recommendation.processing_ms
+            )
+        if state.llm_error:
+            span.set_attribute("llm.error", state.llm_error)
+            span.record_exception(Exception(state.llm_error))
+        
+        return state
+        
+    # End of with block for tracer
 
 
 # ── Node 4: Persist Audit ─────────────────────────────────────────────────────
@@ -518,23 +579,26 @@ async def persist_audit(state: TriageAgentState) -> TriageAgentState:
     does not prevent the audit log from being written, and vice versa.
     """
     alert = CriticalAlert.model_validate(state.alert_dict)
+    with tracer.start_as_current_span("node4.persist_audit") as span:
+        span.set_attribute("patient.id", alert.patient_id)
+        span.set_attribute("alert.id", alert.alert_id)
 
-    if state.recommendation is None:
-        log.warning(
-            "node4_skipped_no_recommendation",
-            patient_id=alert.patient_id,
-            llm_error=state.llm_error,
-        )
-        return state
+        if state.recommendation is None:
+            log.warning(
+                "node4_skipped_no_recommendation",
+                patient_id=alert.patient_id,
+                llm_error=state.llm_error,
+            )
+            return state
 
-    rec = state.recommendation
+        rec = state.recommendation
 
-    # ── Persist to Neon ───────────────────────────────────────────────────────
-    try:
-        async with get_session() as session:
-            await session.execute(
-                text("""
-                    INSERT INTO triage_events (
+        # ── Persist to Neon ───────────────────────────────────────────────────────
+        try:
+            async with get_session() as session:
+                await session.execute(
+                    text("""
+                        INSERT INTO triage_events (
                         alert_id, patient_id, hospital_id, severity,
                         triggered_rules, vitals_snapshot,
                         recommendation_text, recommended_actions,
@@ -567,48 +631,53 @@ async def persist_audit(state: TriageAgentState) -> TriageAgentState:
                     "stripe_event_id":     state.stripe_event_id,
                 },
             )
-        state.audit_persisted = True
-        log.info(
-            "node4_audit_persisted",
-            alert_id=alert.alert_id,
-            patient_id=alert.patient_id,
-        )
-
-    except Exception as exc:
-        log.error(
-            "node4_persist_error",
-            alert_id=alert.alert_id,
-            error=str(exc),
-            exc_info=True,
-        )
-
-    # ── Stripe metered billing event ──────────────────────────────────────────
-    if settings.stripe_secret_key:
-        try:
-            event = stripe.billing.MeterEvent.create(
-                event_name=settings.stripe_meter_event_name,
-                payload={
-                    "value": "1",
-                    "stripe_customer_id": alert.hospital_id,
-                },
-            )
-            state.stripe_event_id = event.identifier
+            state.audit_persisted = True
             log.info(
-                "node4_stripe_meter_event_recorded",
+                "node4_audit_persisted",
                 alert_id=alert.alert_id,
-                stripe_event_id=event.identifier,
+                patient_id=alert.patient_id,
             )
+
         except Exception as exc:
-            # Billing failure must never block clinical data flow
-            log.warning(
-                "node4_stripe_error_non_fatal",
+            log.error(
+                "node4_persist_error",
                 alert_id=alert.alert_id,
                 error=str(exc),
+                exc_info=True,
             )
-    else:
-        log.debug("node4_stripe_skipped", reason="no_stripe_key_configured")
 
-    return state
+        # ── Stripe metered billing event ──────────────────────────────────────────
+        if settings.stripe_secret_key:
+            try:
+                event = stripe.billing.MeterEvent.create(
+                    event_name=settings.stripe_meter_event_name,
+                    payload={
+                        "value": "1",
+                        "stripe_customer_id": alert.hospital_id,
+                    },
+                )
+                state.stripe_event_id = event.identifier
+                log.info(
+                    "node4_stripe_meter_event_recorded",
+                    alert_id=alert.alert_id,
+                    stripe_event_id=event.identifier,
+                )
+            except Exception as exc:
+                # Billing failure must never block clinical data flow
+                log.warning(
+                    "node4_stripe_error_non_fatal",
+                    alert_id=alert.alert_id,
+                    error=str(exc),
+                )
+        else:
+            log.debug("node4_stripe_skipped", reason="no_stripe_key_configured")
+        span.set_attribute("audit.persisted", state.audit_persisted)
+        span.set_attribute(
+            "billing.stripe_event_id", state.stripe_event_id or "skipped"
+        )
+        return state
+        
+    # End of with block for tracer
 
 
 # ── LangGraph StateGraph Assembly ────────────────────────────────────────────
@@ -675,38 +744,54 @@ async def run_triage_agent(alert: CriticalAlert) -> TriageRecommendation | None:
 
     Returns TriageRecommendation on success, None if the LLM node failed.
     """
-    start_ms = time.time() * 1000
-    log.info(
-        "triage_agent_invoked",
-        alert_id=alert.alert_id,
-        patient_id=alert.patient_id,
-        severity=alert.severity.value,
-    )
+    with tracer.start_as_current_span("triage_agent.run") as span:
+        span.set_attribute("alert.id", alert.alert_id)
+        span.set_attribute("patient.id", alert.patient_id)
+        span.set_attribute("alert.severity", alert.severity.value)
+        span.set_attribute("alert.rules_count", len(alert.triggered_rules))
 
-    initial_state = TriageAgentState(
-        alert_dict=alert.model_dump(mode="json"),
-        start_time_ms=start_ms,
-    )
-
-    result = await triage_graph.ainvoke({"state": initial_state})
-    final_state: TriageAgentState = result["state"]
-
-    if final_state.recommendation:
+        start_ms = time.time() * 1000
         log.info(
-            "triage_agent_complete",
+            "triage_agent_invoked",
             alert_id=alert.alert_id,
             patient_id=alert.patient_id,
-            urgency=final_state.recommendation.urgency_level.value,
-            confidence=final_state.recommendation.confidence_score,
-            audit_persisted=final_state.audit_persisted,
-            total_ms=int(time.time() * 1000 - start_ms),
+            severity=alert.severity.value,
         )
-        return final_state.recommendation
 
-    log.error(
-        "triage_agent_failed",
-        alert_id=alert.alert_id,
-        llm_error=final_state.llm_error,
-        context_error=final_state.context_fetch_error,
-    )
-    return None
+        initial_state = TriageAgentState(
+            alert_dict=alert.model_dump(mode="json"),
+            start_time_ms=start_ms,
+        )
+
+        result = await triage_graph.ainvoke({"state": initial_state})
+        
+        final_state: TriageAgentState = result["state"]
+
+        if final_state.recommendation:
+            log.info(
+                "triage_agent_complete",
+                alert_id=alert.alert_id,
+                patient_id=alert.patient_id,
+                urgency=final_state.recommendation.urgency_level.value,
+                confidence=final_state.recommendation.confidence_score,
+                audit_persisted=final_state.audit_persisted,
+                total_ms=int(time.time() * 1000 - start_ms),
+            )
+            span.set_attribute(
+                "output.urgency",
+                final_state.recommendation.urgency_level.value
+            )
+            span.set_attribute(
+                "output.confidence",
+                final_state.recommendation.confidence_score
+            )
+            return final_state.recommendation
+
+        log.error(
+            "triage_agent_failed",
+            alert_id=alert.alert_id,
+            llm_error=final_state.llm_error,
+            context_error=final_state.context_fetch_error,
+        )
+        
+        return None

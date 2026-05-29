@@ -17,3 +17,13 @@ httpx>=0.28.1
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 websockets==13.1
+opentelemetry-sdk==1.42.1
+opentelemetry-api==1.42.1
+opentelemetry-exporter-otlp-proto-http==1.42.1
+opentelemetry-exporter-otlp-proto-common==1.42.1
+opentelemetry-proto==1.42.1
+opentelemetry-instrumentation==0.63b1
+opentelemetry-instrumentation-fastapi==0.63b1
+opentelemetry-instrumentation-sqlalchemy==0.63b1
+protobuf>=5.0,<6
+slowapi==0.1.9

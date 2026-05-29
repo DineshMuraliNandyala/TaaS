@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system dependencies for confluent-kafka C extension
+RUN apt-get update && apt-get install -y \
+    gcc \
+    librdkafka-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+# Non-root user for security
+RUN useradd -m -u 1000 taas && chown -R taas:taas /app
+USER taas

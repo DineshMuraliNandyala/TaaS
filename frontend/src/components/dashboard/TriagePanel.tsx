@@ -61,9 +61,9 @@ export function TriagePanel({ recommendation: rec, onClose }: Props) {
                         </span>
                     </div>
                     <div className="space-y-3">
-                        {rec.recommended_actions.map((action) => (
+                        {rec.recommended_actions.map((action, i) => (
                             <div
-                                key={action.priority}
+                                key={`${action.priority}-${i}`}
                                 className="p-3 rounded-lg bg-gray-800 border border-gray-700"
                             >
                                 <div className="flex items-start gap-3">

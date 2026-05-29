@@ -18,10 +18,22 @@ import type {
 const BASE = '/api/backend'
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-    const res = await fetch(`${BASE}${path}`, {
-        ...init,
-        headers: { 'Content-Type': 'application/json', ...init?.headers },
-    })
+    const doFetch = () =>
+        fetch(`${BASE}${path}`, {
+            ...init,
+            headers: { 'Content-Type': 'application/json', ...init?.headers },
+        })
+
+    let res: Response
+    try {
+        res = await doFetch()
+    } catch (err) {
+        // Retry once after 2s for transient NetworkErrors
+        // (e.g. backend restarting via uvicorn --reload)
+        await new Promise((r) => setTimeout(r, 2000))
+        res = await doFetch()
+    }
+
     if (!res.ok) {
         throw new Error(`API error ${res.status} on ${path}`)
     }

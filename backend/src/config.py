@@ -37,6 +37,16 @@ class Settings(BaseSettings):
     stripe_secret_key: str = ""
     stripe_meter_event_name: str = "triage_event"
 
+    # ── Observability ────────────────────────────────────────────────────────
+    otlp_endpoint: str = ""
+    otlp_headers: str = ""
+    otel_service_name: str = "taas-backend"
+    otel_environment: str = "development"
+    grafana_enabled: bool = False
+
+    # ── Rate limiting ────────────────────────────────────────────────────────
+    rate_limit_per_minute: int = 60
+
     # ── Topics ───────────────────────────────────────────────────────────────
     topic_telemetry: str = "clinical_telemetry"
     topic_alerts: str = "critical_alerts"
@@ -45,6 +55,23 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     hospital_id: str = "HOSP-001"
     environment: str = "development"
+
+    def validate_required_secrets(self) -> None:
+        """
+        Called on startup — fails fast if critical secrets are missing
+        rather than allowing the app to start and fail mid-request.
+        """
+        missing = []
+        if not self.kafka_brokers:
+            missing.append("KAFKA_BROKERS")
+        if not self.database_url:
+            missing.append("DATABASE_URL")
+        if not self.gemini_api_key:
+            missing.append("GEMINI_API_KEY")
+        if missing:
+            raise RuntimeError(
+                f"Missing required environment variables: {', '.join(missing)}"
+            )
 
 
 # Module-level singleton — import this everywhere
